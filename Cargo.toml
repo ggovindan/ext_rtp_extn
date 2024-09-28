@@ -19,3 +19,4 @@ gst-rtp = { package = "gstreamer-rtp", version = "0.21.1", features = ["v1_18"] 
 log = { version = "0.4", features = ["std", "serde"] }
 anyhow = "1"
 priority-queue = "1.2.1"
+lazy_static = "1.5.0"

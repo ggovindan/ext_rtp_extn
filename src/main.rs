@@ -1,125 +1,134 @@
-use gst::{DebugGraphDetails, Element};
+use gst::{ClockTime, DebugGraphDetails, Element};
 use gst::prelude::*;
-use priority_queue::PriorityQueue;
 use gst::*;
-use anyhow::{Error, format_err};
+use lazy_static::lazy_static;
+use std::sync::{Arc, Once, Mutex};
 
-use gst_rtp::RTPBuffer;
+lazy_static! {
+    static ref previous_pts: Mutex<ClockTime> = Mutex::new(ClockTime::from_seconds(0));
+}
 
 fn main() {
     // Initialize GStreamer
     gst::init().unwrap();
 
     // Create elements for the pipeline
-    let pipeline = gst::Pipeline::new();
-    let src = gst::ElementFactory::make("videotestsrc").build().unwrap();
-    let capsfilter = gst::ElementFactory::make("capsfilter").build().unwrap();
-    let enc = gst::ElementFactory::make("x264enc").build().unwrap();
-    let h264parse = gst::ElementFactory::make("h264parse").build().unwrap();
-    let pay = gst::ElementFactory::make("rtph264pay").build().unwrap();
-    let udpsink = ElementFactory::make("udpsink").build().unwrap();
+    //let pipeline_str = "videotestsrc ! video/x-raw,width=1280,height=1080,framerate=30/1 ! x264enc ! h264parse name=h264parse ! hlssink2.video hlssink2 name=hlssink2 playlist-length=5 max-files=7 target-duration=2 send-keyframe-requests=true playlist-location=stream.m3u8";
 
-    h264parse.set_property("config-interval", 1);
-    pay.set_property("config-interval", 1);
-    udpsink.set_property("host", "127.0.0.1");
-    udpsink.set_property("port", 56001 as i32);
-    //let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+    // Working version!!
+    let pipeline_str = "videotestsrc ! video/x-raw,width=1280,height=1080,framerate=30/1 ! x264enc ! h264parse name=h264parse ! splitmuxsink name=splitmuxsink muxer=mpegtsmux max-size-time=2000000000 location=test%05d.ts audiotestsrc is-live=true ! faac name=faac ! splitmuxsink.audio_0";
 
-    // Set properties
-    capsfilter.set_property_from_str("caps", "video/x-raw, width=1280, height=720, framerate=30/1");
-    src.set_property_from_str("is-live", "true");
+    // muxing with ts segment works
+    //let pipeline_str = "videotestsrc ! video/x-raw,width=1280,height=1080,framerate=30/1 ! x264enc ! h264parse name=h264parse ! mpegtsmux ! filesink location=dip.ts";
 
-    // Build the pipeline
-    pipeline.add_many(&[&src, &capsfilter, &enc, &h264parse, &pay, &udpsink]).unwrap();
-    gst::Element::link_many(&[&src, &capsfilter, &enc, &h264parse, &pay, &udpsink]).unwrap();
+    let pipe_elem = gst::parse_launch(pipeline_str).unwrap();
+
+    let pipeline = pipe_elem.clone().downcast::<gst::Pipeline>().unwrap();
+
+    // Get the pipeline objects
+    let h264parse = pipeline.by_name("h264parse").unwrap();
 
 
-    let pay_src_pad = pay.static_pad("src").unwrap();
-    pay_src_pad.add_probe(gst::PadProbeType::BUFFER, |pad, probe_info| {
+    let pay_src_pad = h264parse.static_pad("src").unwrap();
+    pay_src_pad.add_probe(gst::PadProbeType::BUFFER, move |_, probe_info| {
+
         if let Some(probe_data) = probe_info.data.as_mut() {
             if let gst::PadProbeData::Buffer(ref mut buffer) = probe_data {
                 let size = buffer.size();
-                match buffer.pts() {
-                    Some(pts) => {
-                        println!("ptstime={}", pts.seconds())
-                    },
-                    None => {
-                        println!("No PTS, cannot get bandwidth")
-                    }
-                }
+                let pts = buffer.pts().unwrap_or_else(|| ClockTime::from_seconds(0));
+                let dts = buffer.dts().unwrap_or_else(|| ClockTime::from_seconds(0));
 
-                let b = buffer.get_mut().unwrap();
-                let mut rtp_buffer = RTPBuffer::from_buffer_writable(b).unwrap();
+                // Ensure we print the PTS value
+                println!("Original video PTS: {}", pts.seconds());
 
-                    let pts = rtp_buffer.buffer().pts().unwrap();
-                    // Convert the PTS to bytes
-                    let pts_bytes = pts.to_be_bytes();
-                    let extension_data = &pts_bytes[..];
 
-                    let appbits = 5; // Custom application-specific bits
-                    let id = 1; // Custom extension ID
-                    let result = rtp_buffer.add_extension_onebyte_header(id, extension_data);//.add_extension_twobytes_header(appbits, id, extension_data);
+                // Calculate new PTS, ensure it's monotonically increasing
+                let prev_pts = *previous_pts.lock().unwrap();
+                let mut new_pts = pts;
+                if pts > prev_pts {
+                    new_pts = pts + ClockTime::from_seconds(20000)
+               }
 
-                    if let Err(e) = result {
-                        eprintln!("Failed to add RTP header extension: {:?}", e);
-                    }
+                // Update DTS in relation to PTS (DTS should always be <= PTS)
+                let new_dts = if dts <= pts {
+                    dts + ClockTime::from_seconds(19999)
+                } else {
+                    dts
+                };
+               //
+                println!("New video PTS: {}, New DTS: {}", new_pts.seconds(), new_dts.seconds());
+
+                let buffer_mut = buffer.get_mut().unwrap();
+                buffer_mut.set_pts(new_pts);
+                buffer_mut.set_dts(new_dts);
 
             }
         }
-        gst::PadProbeReturn::Ok
+        gst::PadProbeReturn::Pass
     });
 
-    let udpsink_sink_pad = udpsink.static_pad("sink").unwrap();
-    udpsink_sink_pad.add_probe(gst::PadProbeType::BUFFER, |pad, probe_info| {
-        if let Some(probe_data) = probe_info.data.as_ref() {
-            if let gst::PadProbeData::Buffer(buffer) = probe_data {
-                let rtp_buffer = RTPBuffer::from_buffer_readable(buffer).unwrap();
-                // Check for RTP extension header
-                if let Some(extension_data) = rtp_buffer.extension_onebyte_header(1, 0) { //extension_twobytes_header(1, 0) {
-                    println!("RTP Extension present:");
-                    //println!("App bits: {}", bits);
-                    println!("Extension data: {:?}", extension_data);
+    let faac = pipeline.by_name("faac").unwrap();
 
-                    // Convert the extension data back to PTS
-                    if extension_data.len() != 0 {
-                        //let mut pts_bytes = [0u8; 8];
-                        //pts_bytes[..4].copy_from_slice(&extension_data[..4]);  // Copy the first 4 bytes
-                        //let pts = u64::from_be_bytes(pts_bytes);
-                        let pts = u64::from_be_bytes(extension_data.try_into().unwrap());
-                        println!("Extracted PTS from RTP extension: {}", pts);
-                    }
+    let faac_src_pad = faac.static_pad("src").unwrap();
+
+    faac_src_pad.add_probe(gst::PadProbeType::BUFFER, move |_, probe_info| {
+        if let Some(probe_data) = probe_info.data.as_mut() {
+            if let gst::PadProbeData::Buffer(ref mut buffer) = probe_data {
+                let size = buffer.size();
+                let pts = buffer.pts().unwrap_or_else(|| ClockTime::from_seconds(0));
+                let dts = buffer.dts().unwrap_or_else(|| ClockTime::from_seconds(0));
+
+                // Ensure we print the PTS value
+                println!("Original audio PTS: {}", pts.seconds());
+
+
+                // Calculate new PTS, ensure it's monotonically increasing
+                let prev_pts = *previous_pts.lock().unwrap();
+                let mut new_pts = pts;
+                if pts > prev_pts {
+                    new_pts = pts + ClockTime::from_seconds(20000)
+                }
+
+                // Update DTS in relation to PTS (DTS should always be <= PTS)
+                let new_dts = if dts <= pts {
+                    dts + ClockTime::from_seconds(19999)
                 } else {
-                    println!("No RTP Extension found");
-                }
-                match rtp_buffer.buffer().pts() {
-                    Some(pts) => {
-                        println!("udpsink buffer.pts={}", pts.seconds());
-                    },
-                    None => {
-                        println!("No PTS, cannot get bandwidth");
-                    }
-                }
+                    dts
+                };
+                //
+                println!("New audio PTS: {}, New DTS: {}", new_pts.seconds(), new_dts.seconds());
+
+                let buffer_mut = buffer.get_mut().unwrap();
+                buffer_mut.set_pts(new_pts);
+                buffer_mut.set_dts(new_dts);
+
             }
         }
-        gst::PadProbeReturn::Ok
-    }).unwrap();
+        gst::PadProbeReturn::Pass
+    });
 
-
+    let splitmuxsink = pipeline.by_name("splitmuxsink").unwrap();
+    splitmuxsink.connect("split-now", true, |test| {
+        println!("got the callback for split-now {:#?}", test);
+        None
+    });
 
     // Add RTP header extension
     let bus = pipeline.bus().unwrap();
     let pipeline_weak = pipeline.downgrade();
-    let _watch = bus.add_watch_local(move |_, msg| {
-        if let Some(pipeline) = pipeline_weak.upgrade() {
-            match msg.view() {
-                gst::MessageView::Element(msg) => {
-                    println!("msg.name()={}", msg.src().unwrap().name());
-                },
-                _ => (),
+    let _watch = bus
+        .add_watch_local(move |_, msg| {
+            if let Some(pipeline) = pipeline_weak.upgrade() {
+                match msg.view() {
+                    gst::MessageView::Element(msg) => {
+                        println!("msg.name()={}", msg.src().unwrap().name());
+                    }
+                    _ => (),
+                }
             }
-        }
-        glib::ControlFlow::Continue
-    }).unwrap();
+            glib::ControlFlow::Continue
+        })
+        .unwrap();
 
     // Start the pipeline
     pipeline.set_state(gst::State::Playing).unwrap();
